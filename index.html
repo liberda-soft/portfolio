@@ -78,8 +78,9 @@
     return a;
   }
 
-  // Tight scatter. Every item gets a random size and is dropped at the spot
-  // (out of many random ones) where it sits highest and leaves the least air.
+  // Tight scatter. Items get random sizes and are slid into the highest free
+  // spot (big ones first, small ones fill holes); then each one is pulled up and
+  // grown until it meets its neighbours, so little air is left.
   // Cut-outs carry their outline (it.t / it.b = top / bottom edge per column),
   // so they nest into each other's shapes; drawn pixels never overlap.
   function layout() {
@@ -87,86 +88,155 @@
     var rand = rng(seed * 7919 + 13);
     var W = stage.clientWidth;
     var small = W < 620, mid = W < 1050;
-    var CELL = 3, cols = Math.max(1, Math.floor(W / CELL));
-    var gFrame = Math.max(6, W * (small ? 0.016 : 0.007));   // gap around photos / framed renders
-    var gCut = Math.max(3, W * (small ? 0.008 : 0.003));     // gap around cut-outs
+    var CELL = 2, cols = Math.max(1, Math.floor(W / CELL));
+    var gFrame = Math.max(4, W * (small ? 0.011 : 0.0042));  // gap around photos / framed renders
+    var gCut = Math.max(2, W * (small ? 0.005 : 0.0016));    // gap around cut-outs
     var aMin = small ? 0.16 : mid ? 0.055 : 0.022;           // item area as share of W*W
     var aMax = small ? 0.34 : mid ? 0.12 : 0.062;
-    var maxW = W * (small ? 0.82 : mid ? 0.5 : 0.36);
-    var sky = new Float32Array(cols);    // lowest drawn pixel so far, per column
-    var need = new Float32Array(cols);   // gap wanted by whatever is there
-    var bottom = 0, minX = W, maxX = 0, placed = [];
+    var maxN = Math.floor(W * (small ? 0.82 : mid ? 0.5 : 0.36) / CELL);
+    var growN = Math.min(cols, Math.floor(W * (small ? 0.96 : mid ? 0.62 : 0.44) / CELL));
+    var c, k;
 
-    order.forEach(function (idx) {
-      var it = current.items[idx], el = stage.children[idx];
-      var ar = it.w / it.h;
+    // a slightly uneven invisible ceiling, so the first row is not ruler-straight
+    var lip = new Float32Array(cols);
+    for (c = 0; c < cols;) {
+      var seg = Math.max(8, Math.round(cols * (0.06 + rand() * 0.12))), l = rand() * W * 0.018;
+      for (k = c; k < Math.min(cols, c + seg); k++) lip[k] = l;
+      c += seg;
+    }
+    function fresh(skip) {             // taken [from, to] spans per column, without item `skip`
+      var occ = [], i;
+      for (i = 0; i < cols; i++) occ.push([[-1e6, lip[i]]]);
+      items.forEach(function (o) { if (o !== skip && o.s) claim(occ, o.s, o.d, o.x0, o.y); });
+      return occ;
+    }
+    function shape(o, n) {             // outline at a width of n columns, padded by half a gap
+      var it = o.it, hh = n * CELL / o.ar, half = o.g / 2, d = o.d, m = n + 2 * d;
+      var top = new Float32Array(m), bot = new Float32Array(m), i, j, q, lo, hi, tt, bb;
+      for (i = 0; i < m; i++) {
+        lo = 1e9; hi = -1e9;
+        for (j = Math.max(0, i - 2 * d); j <= Math.min(n - 1, i); j++) {
+          if (it.t) {
+            q = Math.min(it.t.length - 1, Math.floor((j + 0.5) / n * it.t.length));
+            if (it.t[q] < 0) continue;
+            tt = it.t[q] / 100 * hh; bb = it.b[q] / 100 * hh;
+          } else { tt = 0; bb = hh; }
+          if (tt < lo) lo = tt; if (bb > hi) hi = bb;
+        }
+        if (hi === -1e9) { top[i] = 0; bot[i] = -1e9; } else { top[i] = lo - half; bot[i] = hi + half; }
+      }
+      return { n: n, h: hh, m: m, top: top, bot: bot };
+    }
+    function drop(occ, s, d, x0, y) {  // highest free y (not above y) for shape s at x0
+      var moved = true, i, j, col, a, b2, list;
+      while (moved) {
+        moved = false;
+        for (i = 0; i < s.m; i++) {
+          if (s.bot[i] === -1e9) continue;
+          col = x0 - d + i;
+          if (col < 0 || col >= cols) continue;
+          list = occ[col]; a = y + s.top[i]; b2 = y + s.bot[i];
+          for (j = 0; j < list.length; j++) {
+            if (list[j][0] < b2 && list[j][1] > a) {
+              y = list[j][1] - s.top[i]; a = y + s.top[i]; b2 = y + s.bot[i]; moved = true;
+            }
+          }
+        }
+      }
+      return y;
+    }
+    function isFree(occ, s, d, x0, y) {
+      var i, j, col, a, b2, list;
+      for (i = 0; i < s.m; i++) {
+        if (s.bot[i] === -1e9) continue;
+        col = x0 - d + i;
+        if (col < 0 || col >= cols) continue;
+        list = occ[col]; a = y + s.top[i]; b2 = y + s.bot[i];
+        for (j = 0; j < list.length; j++) if (list[j][0] < b2 && list[j][1] > a) return false;
+      }
+      return true;
+    }
+    function claim(occ, s, d, x0, y) {
+      for (var i = 0; i < s.m; i++) {
+        var col = x0 - d + i;
+        if (s.bot[i] === -1e9 || col < 0 || col >= cols) continue;
+        occ[col].push([y + s.top[i], y + s.bot[i]]);
+      }
+    }
+
+    // sizes first, then order: bigger before smaller (with some noise)
+    var items = order.map(function (idx) {
+      var it = current.items[idx], ar = it.w / it.h;
       var area = (aMin + rand() * (aMax - aMin)) * W * W;
-      var w = Math.min(Math.sqrt(area * ar), maxW, cols * CELL);
-      var h = w / ar;
-      var n = Math.max(1, Math.min(cols, Math.round(w / CELL)));
+      var n = Math.max(1, Math.min(maxN, cols, Math.round(Math.sqrt(area * ar) / CELL)));
       var g = it.t ? gCut : gFrame;
-      var top = new Float32Array(n), bot = new Float32Array(n), c, k;
-      for (c = 0; c < n; c++) {
-        if (it.t) {
-          k = Math.min(it.t.length - 1, Math.floor((c + 0.5) / n * it.t.length));
-          if (it.t[k] < 0) { top[c] = -1; bot[c] = -1; }
-          else { top[c] = it.t[k] / 100 * h; bot[c] = it.b[k] / 100 * h; }
-        } else { top[c] = 0; bot[c] = h; }
-      }
+      return { it: it, el: stage.children[idx], ar: ar, g: g, d: Math.max(1, Math.ceil(g / 2 / CELL)),
+               n0: n, key: n * n / ar * (0.55 + rand() * 0.9), s: null, x0: 0, y: 0 };
+    });
+    items.sort(function (p, q) { return q.key - p.key; });
 
-      // candidate spots: random ones plus ones flush against what is already placed
-      var xs = [], e;
-      for (e = 0; e < 40; e++) xs.push(Math.floor(rand() * (cols - n + 1)));
-      for (e = 1; e < cols; e++) {
-        if (sky[e] !== sky[e - 1]) { xs.push(e); xs.push(e - n); }
-      }
-      xs.push(0); xs.push(cols - n);
-      var base = rand() * W * 0.03, sliver = W * (small ? 0.3 : 0.13);
-      var best = null;
-      for (var t = 0; t < xs.length; t++) {
-        var x0 = xs[t];
-        if (x0 < 0 || x0 > cols - n) continue;
-        var y = base, s, v;
-        for (c = 0; c < n; c++) {
-          if (top[c] < 0) continue;
-          s = sky[x0 + c];
-          if (s > 0) { v = s + Math.max(need[x0 + c], g) - top[c]; if (v > y) y = v; }
-        }
-        var air = 0, cnt = 0;
-        for (c = 0; c < n; c++) {
-          if (top[c] < 0) continue;
-          air += y + top[c] - sky[x0 + c]; cnt++;
-        }
-        // empty strip left beside the item that nothing else could use
-        var gl = 0, gr = 0;
-        for (c = x0 - 1; c >= 0 && sky[c] <= y + h * 0.15; c--) gl++;
-        for (c = x0 + n; c < cols && sky[c] <= y + h * 0.15; c++) gr++;
-        var waste = (gl > 1 && gl * CELL < sliver ? gl * CELL : 0) + (gr > 1 && gr * CELL < sliver ? gr * CELL : 0);
-        var cost = y + 0.7 * (cnt ? air / cnt : 0) + waste * 1.2 + rand() * h * 0.1;
+    // 1. place
+    var step = Math.max(1, Math.round(cols / 220)), occ = fresh(null);
+    items.forEach(function (o) {
+      var s = shape(o, o.n0), n = s.n, best = null, mid2 = (cols - n) / 2, x0, y, cost;
+      for (x0 = 0; x0 <= cols - n; x0 += step) {
+        y = drop(occ, s, o.d, x0, 0);
+        cost = y + Math.abs(x0 - mid2) * CELL * 0.02 + rand() * s.h * 0.05;
         if (!best || cost < best.cost) best = { x0: x0, y: y, cost: cost };
       }
-
-      // claim the columns, widened sideways by the gap
-      var d = Math.ceil(g / CELL);
-      for (c = -d; c < n + d; c++) {
-        var col = best.x0 + c;
-        if (col < 0 || col >= cols) continue;
-        var m = -1;
-        for (k = Math.max(0, c - d); k <= Math.min(n - 1, c + d); k++) {
-          if (top[k] >= 0 && bot[k] > m) m = bot[k];
-        }
-        if (m >= 0 && best.y + m > sky[col]) { sky[col] = best.y + m; need[col] = g; }
-      }
-      bottom = Math.max(bottom, best.y + h);
-      minX = Math.min(minX, best.x0 * CELL); maxX = Math.max(maxX, (best.x0 + n) * CELL);
-      placed.push([el, best.x0 * CELL]);
-      el.style.top = best.y + 'px';
-      el.style.width = (n * CELL) + 'px'; el.style.height = (n * CELL / ar) + 'px';
+      o.s = s; o.x0 = best.x0; o.y = best.y;
+      claim(occ, s, o.d, o.x0, o.y);
     });
-    // centre the whole cluster
-    var shift = (W - (maxX - minX)) / 2 - minX;
-    placed.forEach(function (p) { p[0].style.left = (p[1] + shift) + 'px'; });
-    stage.style.height = (bottom + gFrame * 4) + 'px';
+
+    function settle() {                // pull everything up as far as it goes
+      items.slice().sort(function (p, q) { return p.y - q.y; }).forEach(function (o) {
+        o.y = drop(fresh(o), o.s, o.d, o.x0, 0);
+      });
+    }
+    function squeeze() {               // slide everything sideways towards the middle
+      var mid2 = cols / 2;
+      items.slice().sort(function (p, q) {
+        return Math.abs(p.x0 + p.s.n / 2 - mid2) - Math.abs(q.x0 + q.s.n / 2 - mid2);
+      }).forEach(function (o) {
+        var oc = fresh(o), dir = o.x0 + o.s.n / 2 < mid2 ? 1 : -1, x = o.x0, lim = Math.abs(mid2 - (o.x0 + o.s.n / 2));
+        while (lim-- > 0 && x + dir >= 0 && x + dir <= cols - o.s.n && isFree(oc, o.s, o.d, x + dir, o.y)) x += dir;
+        o.x0 = x;
+      });
+    }
+    function grow() {                  // enlarge each item until it meets a neighbour
+      shuffle(items.length, rand).forEach(function (i) {
+        var o = items[i], oc = fresh(o), n = o.s.n, hh = o.s.h, bestFit = null;
+        // keep the centre or one of the corners fixed, whichever lets it grow most
+        [[0.5, 0.5], [0, 0], [1, 0], [0, 1], [1, 1], [0.5, 0], [0.5, 1]].forEach(function (an) {
+          var px = o.x0 + n * an[0], py = o.y + hh * an[1];
+          var lo = 1, hi = 1.8, t, f, n2, s2, x2, y2;
+          for (t = 0; t < 7; t++) {
+            f = (lo + hi) / 2;
+            n2 = Math.min(growN, Math.round(n * f));
+            s2 = shape(o, n2); x2 = Math.round(px - n2 * an[0]); y2 = py - s2.h * an[1];
+            if (n2 > n && x2 >= 0 && x2 <= cols - n2 && isFree(oc, s2, o.d, x2, y2)) {
+              if (!bestFit || n2 > bestFit.s.n) bestFit = { s: s2, x0: x2, y: y2 };
+              lo = f;
+            } else hi = f;
+          }
+        });
+        if (bestFit) { o.s = bestFit.s; o.x0 = bestFit.x0; o.y = bestFit.y; }
+      });
+    }
+    // 2. close the gaps
+    settle(); squeeze(); settle(); grow(); settle(); squeeze(); settle(); grow(); settle();
+
+    var bottom = 0, minX = W, maxX = 0;
+    items.forEach(function (o) {
+      bottom = Math.max(bottom, o.y + o.s.h);
+      minX = Math.min(minX, o.x0 * CELL); maxX = Math.max(maxX, (o.x0 + o.s.n) * CELL);
+    });
+    var shift = (W - (maxX - minX)) / 2 - minX;      // centre the whole cluster
+    items.forEach(function (o) {
+      o.el.style.left = (o.x0 * CELL + shift) + 'px'; o.el.style.top = o.y + 'px';
+      o.el.style.width = (o.s.n * CELL) + 'px'; o.el.style.height = o.s.h + 'px';
+    });
+    stage.style.height = (bottom + gFrame * 6) + 'px';
   }
 
   function show(id) {
